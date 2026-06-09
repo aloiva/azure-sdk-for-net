@@ -47,6 +47,13 @@ namespace Microsoft.Azure.WebJobs.EventHubs.Listeners
             private readonly CancellationToken _functionExecutionToken;
             private readonly CancellationTokenSource _ownershipLostTokenSource;
 
+            // Idle checkpoint: when BatchCheckpointFrequency > 1, force a checkpoint after
+            // this interval of inactivity to prevent stale checkpoints from blocking scale-in.
+            private const int IdleCheckpointIntervalSeconds = 60;
+            private EventData _lastProcessedEvent;
+            private Timer _idleCheckpointTimer;
+            private readonly SemaphoreSlim _idleCheckpointGuard = new SemaphoreSlim(1, 1);
+
             /// <summary>
             /// When we have a minimum batch size greater than 1, this class manages caching events.
             /// </summary>
@@ -74,18 +81,39 @@ namespace Microsoft.Azure.WebJobs.EventHubs.Listeners
                 }
             }
 
-            public Task CloseAsync(EventProcessorHostPartition context, ProcessingStoppedReason reason)
+            public async Task CloseAsync(EventProcessorHostPartition context, ProcessingStoppedReason reason)
             {
+                // Stop the idle checkpoint timer first to prevent races.
+                _idleCheckpointTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+
                 if (reason == ProcessingStoppedReason.OwnershipLost)
                 {
                     _ownershipLostTokenSource.Cancel();
+                }
+                else if (_enableCheckpointing
+                    && _batchCheckpointFrequency > 1
+                    && _batchCounter > 0
+                    && _lastProcessedEvent != null
+                    && !_functionExecutionToken.IsCancellationRequested)
+                {
+                    // Flush un-checkpointed work on graceful shutdown (not ownership loss)
+                    // to prevent stale checkpoints from blocking scale-in.
+                    try
+                    {
+                        await context.CheckpointAsync(_lastProcessedEvent).ConfigureAwait(false);
+                        _batchCounter = 0;
+                        _logger.LogDebug(GetOperationDetails(context, "CloseAsync_FlushCheckpoint"));
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning($"Failed to flush checkpoint on close for partition '{context.PartitionId}': {ex.Message}");
+                    }
                 }
 
                 // clear the cached events
                 CachedEventsManager?.ClearEventCache();
 
                 _logger.LogDebug(GetOperationDetails(context, $"CloseAsync, {reason}"));
-                return Task.CompletedTask;
             }
 
             public Task OpenAsync(EventProcessorHostPartition context)
@@ -239,7 +267,9 @@ namespace Microsoft.Azure.WebJobs.EventHubs.Listeners
                     && !_functionExecutionToken.IsCancellationRequested
                     && !_ownershipLostTokenSource.IsCancellationRequested)
                 {
+                    _lastProcessedEvent = eventToCheckpoint;
                     await CheckpointAsync(eventToCheckpoint, context).ConfigureAwait(false);
+                    ResetIdleCheckpointTimer(context);
                 }
             }
 
@@ -423,12 +453,86 @@ namespace Microsoft.Azure.WebJobs.EventHubs.Listeners
                 }
             }
 
+            private void ResetIdleCheckpointTimer(EventProcessorHostPartition context)
+            {
+                if (_batchCheckpointFrequency <= 1 || !_enableCheckpointing)
+                {
+                    return;
+                }
+
+                // If the batch counter was reset to 0 by CheckpointAsync, there's nothing pending —
+                // disable the timer until new un-checkpointed work appears.
+                if (_batchCounter == 0)
+                {
+                    _idleCheckpointTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+                    return;
+                }
+
+                var interval = TimeSpan.FromSeconds(IdleCheckpointIntervalSeconds);
+                if (_idleCheckpointTimer == null)
+                {
+                    _idleCheckpointTimer = new Timer(
+                        OnIdleCheckpointTimerFired,
+                        context,
+                        interval,
+                        Timeout.InfiniteTimeSpan);
+                }
+                else
+                {
+                    _idleCheckpointTimer.Change(interval, Timeout.InfiniteTimeSpan);
+                }
+            }
+
+            private async void OnIdleCheckpointTimerFired(object state)
+            {
+                if (_functionExecutionToken.IsCancellationRequested
+                    || _ownershipLostTokenSource.IsCancellationRequested
+                    || _listenerCancellationToken.IsCancellationRequested)
+                {
+                    return;
+                }
+
+                var acquired = false;
+                try
+                {
+                    acquired = await _idleCheckpointGuard.WaitAsync(0).ConfigureAwait(false);
+                    if (!acquired)
+                    {
+                        // Another checkpoint operation is in progress; skip this cycle.
+                        return;
+                    }
+
+                    var context = (EventProcessorHostPartition)state;
+                    var eventToCheckpoint = _lastProcessedEvent;
+
+                    if (_batchCounter > 0 && eventToCheckpoint != null && _enableCheckpointing)
+                    {
+                        await context.CheckpointAsync(eventToCheckpoint).ConfigureAwait(false);
+                        _batchCounter = 0;
+                        _logger.LogDebug(GetOperationDetails(context, "IdleCheckpoint"));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning($"Idle checkpoint failed: {ex.Message}");
+                }
+                finally
+                {
+                    if (acquired)
+                    {
+                        _idleCheckpointGuard.Release();
+                    }
+                }
+            }
+
             protected virtual void Dispose(bool disposing)
             {
                 if (!_disposed)
                 {
                     if (disposing)
                     {
+                        _idleCheckpointTimer?.Dispose();
+                        _idleCheckpointGuard?.Dispose();
                         _cachedEventsBackgroundTaskCts?.Dispose();
                         _cachedEventsGuard?.Dispose();
                     }
